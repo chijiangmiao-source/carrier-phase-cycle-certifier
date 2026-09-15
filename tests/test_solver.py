@@ -282,6 +282,49 @@ def test_medium_scale_matches_quadratic_dp():
 
 
 # ---------------------------------------------------------------------------
+# Arbitrary-precision integers (beyond CPython's 4300-digit str limit)
+# ---------------------------------------------------------------------------
+
+
+def test_huge_integers_exact_solve():
+    M = 10**9
+    big = 10**5000  # 5001 decimal digits, beyond the 4300-digit default limit
+    result = solve(M, 2, [0, 123456], big, [big + 123456], [big + 123456])
+    assert result == {
+        "status": "unique",
+        "x": [big, 2 * big + 123456],
+        "cost": 0,
+        "increments": [big + 123456],
+    }
+
+
+def test_huge_integers_ambiguous_witnesses_exact():
+    M = 10**9
+    big = 10**5000
+    # two candidates: big + 123456 and big + 123456 + M -> ambiguous, cost 0
+    result = solve(M, 2, [0, 123456], big, [big + 123456],
+                   [big + 123456 + M])
+    assert result["status"] == "ambiguous"
+    assert result["cost"] == 0
+    w1, w2 = result["witnesses"]
+    assert w1["x"] == [big, 2 * big + 123456]
+    assert w2["x"] == [big, 2 * big + 123456 + M]
+    assert w1["increments"] == [big + 123456]
+    assert w2["increments"] == [big + 123456 + M]
+
+
+def test_huge_integer_in_error_message():
+    M = 10**9
+    big = 10**5000
+    with pytest.raises(DomainError) as exc:
+        solve(M, 1, [0], big + 1, [], [])
+    assert exc.value.code == "INVALID_START"
+    # formatting the payload must not raise on the huge value
+    payload = exc.value.payload()
+    assert payload["error"]["code"] == "INVALID_START"
+
+
+# ---------------------------------------------------------------------------
 # Full-scale limit: n = 20000, 64 candidates per epoch
 # ---------------------------------------------------------------------------
 

@@ -107,6 +107,18 @@ def main() -> int:
               and resp.json() == {"status": "impossible",
                                   "first_empty_index": 2}, resp.text)
 
+        # -- arbitrary-precision integers (> 4300 decimal digits) ----------
+        big = 10**5000
+        resp = post({"M": 10**9, "n": 2, "r": [0, 123456], "x0": big,
+                     "lo": [big + 123456], "hi": [big + 123456]})
+        check("huge integers (>4300 digits) solved exactly",
+              resp.status_code == 200 and resp.json() == {
+                  "status": "unique",
+                  "x": [big, 2 * big + 123456],
+                  "cost": 0,
+                  "increments": [big + 123456],
+              }, resp.text[:200])
+
         # -- brute-force cross-check on random small instances ------------
         rng = random.Random(20260915)
         mismatches = 0

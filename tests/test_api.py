@@ -188,3 +188,35 @@ def test_schema_error_non_finite_numbers_rejected():
 
 def test_method_not_allowed():
     assert client.get("/solve").status_code == 405
+
+
+# ---------------------------------------------------------------------------
+# Arbitrary-precision integers (> 4300 decimal digits)
+# ---------------------------------------------------------------------------
+
+
+def test_huge_integers_solved_exactly_over_http():
+    big = 10**5000  # 5001 digits, beyond CPython's 4300-digit str limit
+    resp = _post({"M": 10**9, "n": 2, "r": [0, 123456], "x0": big,
+                  "lo": [big + 123456], "hi": [big + 123456]})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "unique",
+        "x": [big, 2 * big + 123456],
+        "cost": 0,
+        "increments": [big + 123456],
+    }
+
+
+def test_huge_integer_domain_error_is_structured_not_500():
+    big = 10**5000
+    resp = _post({"M": 10**9, "n": 1, "r": [0], "x0": big + 1,
+                  "lo": [], "hi": []})
+    assert _error_code(resp) == "INVALID_START"
+
+
+def test_huge_interval_endpoint_domain_error_is_structured():
+    big = 10**5000
+    resp = _post({"M": 10**9, "n": 2, "r": [0, 1], "x0": 0,
+                  "lo": [big], "hi": [big - 1]})
+    assert _error_code(resp) == "INVALID_INTERVAL"
