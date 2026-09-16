@@ -2,8 +2,11 @@
 
 Endpoints
 ---------
-* ``POST /solve``  — solve one instance; always answers deterministically.
-* ``GET  /health`` — liveness probe used by the compose healthcheck.
+* ``POST /solve``           — solve one instance; always answers
+                              deterministically.
+* ``POST /analyze-windows`` — one baseline instance plus a batch of
+                              independent windowed what-if scenarios.
+* ``GET  /health``          — liveness probe used by the compose healthcheck.
 
 All responses are plain JSON produced from dicts in a fixed key order, so a
 repeated request body yields byte-identical response bytes.
@@ -14,8 +17,9 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .analyze import Window, analyze_windows
 from .errors import DomainError
-from .schemas import SolveRequest
+from .schemas import AnalyzeWindowsRequest, SolveRequest
 from .solver import solve
 
 app = FastAPI(
@@ -63,3 +67,11 @@ def health() -> dict:
 def solve_endpoint(request: SolveRequest) -> dict:
     return solve(request.M, request.n, request.r, request.x0,
                  request.lo, request.hi)
+
+
+@app.post("/analyze-windows")
+def analyze_windows_endpoint(request: AnalyzeWindowsRequest) -> dict:
+    windows = [Window(sc.start, sc.end, sc.lo, sc.hi)
+               for sc in request.scenarios]
+    return analyze_windows(request.M, request.n, request.r, request.x0,
+                           request.lo, request.hi, windows)

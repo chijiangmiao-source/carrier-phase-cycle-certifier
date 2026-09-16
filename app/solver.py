@@ -109,6 +109,22 @@ def validate_domain(M: int, n: int, r: list[int], x0: int,
             )
 
 
+def _interval_candidate_span(M: int, target: int, lo_i: int, hi_i: int
+                             ) -> tuple[int, int]:
+    """Smallest integer ``>= lo_i`` congruent to ``target (mod M)`` and how
+    many such integers lie in the closed interval ``[lo_i, hi_i]`` (0 when
+    none).
+
+    Pure integer arithmetic, so negative bounds behave correctly.  The count
+    is returned instead of the list so callers can enforce the
+    ``MAX_CANDIDATES`` limit before materialising anything.
+    """
+    start = lo_i + ((target - lo_i) % M)
+    if start > hi_i:
+        return start, 0
+    return start, (hi_i - start) // M + 1
+
+
 def build_candidates(M: int, n: int, r: list[int],
                      lo: list[int], hi: list[int]) -> tuple[list, int | None]:
     """Build the sorted candidate increment list per epoch.
@@ -131,15 +147,13 @@ def build_candidates(M: int, n: int, r: list[int],
     cands: list = [None] * n
     first_empty: int | None = None
     for i in range(1, n):
-        lo_i = lo[i - 1]
-        hi_i = hi[i - 1]
         target = (r[i] - r[i - 1]) % M
-        start = lo_i + ((target - lo_i) % M)
-        if start > hi_i:
+        start, count = _interval_candidate_span(M, target, lo[i - 1],
+                                                hi[i - 1])
+        if count == 0:
             if first_empty is None:
                 first_empty = i
             continue
-        count = (hi_i - start) // M + 1
         if count > MAX_CANDIDATES:
             raise DomainError(
                 "TOO_MANY_CANDIDATES",

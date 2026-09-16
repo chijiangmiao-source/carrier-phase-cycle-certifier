@@ -9,6 +9,11 @@
 - 不唯一 → 返回 `ambiguous` 及按 `x` 字典序最小的两条最优见证；
 - 无解 → 返回 `impossible` 及首个无候选的时刻。
 
+此外提供 `POST /analyze-windows`：复核异常区段时，无需为每套增量区间
+修订重复提交并重跑整条时间线——一份基线请求可携带多套独立场景，每套
+场景只替换一个连续历元窗口的 `lo/hi`，服务先返回基线结论，再按输入
+顺序逐场景返回最优结论与相对基线的代价差值。
+
 纯后端实现：Python 3.13 + FastAPI + Pydantic，全程**精确整数运算，禁用浮点**，
 允许负的 `x` 与负增量，闭区间端点一律包含。
 
@@ -55,6 +60,29 @@
 - 计数为 1 → `unique`；计数 ≥ 2（截断后恰为 2）→ `ambiguous`；
   某时刻候选为空 → `impossible`。
 
+### 窗口化批量分析（/analyze-windows）
+
+在基线实例上各做一次**双向动态规划**并只缓存场景窗口边界上的行：
+
+- 逆向行 `g_i(c)`（同 §2）与正向行 `f_i(c) = min_{c′∈C_{i−1}} f_{i−1}(c′)
+  + |c − c′|`（`f_1(·) = 0`），两者都携带截断到 2 的最优方案数；
+- 场景替换窗口 `[a, b]` 时，只在窗口内重算：以 `f_{a−1}` 为前缀边界
+  （`a = 1` 时从零行起步），用同一 L1 距离变换扫过替换候选得到 `h_b`，
+  再与后缀边界 `g_{b+1}` 拼接（`b = n−1` 时直接取 `h_b` 的最小值）：
+
+  ```
+  cost = min_c h_b(c) + min_{c′∈C_{b+1}} |c′ − c| + g_{b+1}(c′)
+  ```
+
+  计数按边界候选相乘、按取最小值处相加，同样在 2 处截断（截断对乘积
+  与求和都封闭，结论与全量重算完全一致）。
+
+候选生成与截断计数完全复用求解器；单场景工作量 `O(w·K)`（`w` 为窗口
+长度），整批为 `O((n+P)·K)`（`P` 为全部场景的替换点总数），**不会**
+退化为场景数乘全长，也绝不逐场景调用求解器。基线的空候选历元只收集
+一次：场景窗口外的空历元在替换后仍然存在，窗口内新区间也可能自造空
+历元，两者取最早者即为该场景的 `first_empty_index`。
+
 ## 3. 复算规则（验收口径）
 
 给定响应后，可按以下规则独立复算，全部只用整数：
@@ -79,6 +107,10 @@
    起点不同余 → `INVALID_START`；`lo_i > hi_i` → `INVALID_INTERVAL`；
    候选数 > 64 → `TOO_MANY_CANDIDATES`。所有非法输入（422）优先于
    无解判定（200 + `impossible`）：只要请求本身非法，一律返回结构化错误。
+8. **批量分析**：`/analyze-windows` 的每个场景可独立复算——把基线
+   `lo/hi` 的 `[start, end]` 段替换为场景值后按规则 1–4 重算代价与
+   计数即得该场景的 `cost` 与 `unique`/`ambiguous`；`delta` 为场景
+   代价减去基线代价；无解与场景级非法同样按修改后的实例判定。
 
 ## 4. API
 
@@ -128,6 +160,56 @@
 | `INVALID_INTERVAL` | 某 `lo_i > hi_i` |
 | `TOO_MANY_CANDIDATES` | 某区间模差候选数 > 64 |
 
+### `POST /analyze-windows`
+
+接收一份现有求解请求外加 `scenarios` 数组，比较多套独立的增量区间
+修订。每个场景只替换一个**连续历元窗口**的 `lo/hi`：
+
+```json
+{
+  "M": 5, "n": 3, "r": [0, 1, 2], "x0": 0,
+  "lo": [1, 6], "hi": [1, 6],
+  "scenarios": [
+    {"start": 1, "end": 1, "lo": [0], "hi": [10]},
+    {"start": 1, "end": 2, "lo": [0, 0], "hi": [10, 10]}
+  ]
+}
+```
+
+- `start`/`end`：被替换窗口的首末历元（增量下标，闭区间，
+  `1 ≤ start ≤ end ≤ n−1`）；`lo`/`hi` 为替换值，长度须恰为
+  `end − start + 1`；
+- 场景按输入顺序编号（`index` 从 0 起），彼此独立（都只作用于基线）；
+- 全部场景的替换点总数 `Σ(end − start + 1)` 不得超过 **20000**；
+- 场景结构非法（`start < 1`、`end < start`、替换数组长度不符、
+  `end > n−1`、总点数超限）→ 整请求 422 `VALIDATION_ERROR`；
+- **基线请求非法** → 整请求 422，错误码与优先级同 `POST /solve`。
+
+响应（HTTP 200）：先给基线结论，再按输入顺序逐场景给结论：
+
+```json
+{
+  "baseline": {"status": "unique", "cost": 5},
+  "scenarios": [
+    {"index": 0, "status": "unique", "cost": 0, "delta": -5},
+    {"index": 1, "status": "ambiguous", "cost": 0, "delta": -5},
+    {"index": 2, "status": "impossible", "first_empty_index": 1},
+    {"index": 3, "status": "error",
+     "error": {"code": "INVALID_INTERVAL", "message": "...", "index": 2}}
+  ]
+}
+```
+
+- `baseline`：`{"status": "unique"|"ambiguous", "cost"}` 或
+  `{"status": "impossible", "first_empty_index"}`（紧凑结论，不含见证）；
+- 场景可行：`status` 为 `unique`/`ambiguous`，`cost` 为最优代价，
+  `delta = 场景代价 − 基线代价`（**仅当基线可行时**携带该字段）；
+- 场景无解：`first_empty_index` 为修改后实例的首个空候选历元（可能是
+  窗口外基线遗留的空历元，也可能是窗口内自造的空历元，取最早者）；
+- 场景内 `lo_i > hi_i` 或替换区间候选数 > 64 → **仅拒绝该场景**：
+  该条 `status` 为 `error` 并带结构化错误信封（`index` 为出错历元），
+  其余场景不受影响，批量结果稳定有序、重复请求逐字节一致。
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，供容器健康检查使用。
@@ -166,14 +248,17 @@ app/
   main.py       FastAPI 应用：路由、结构化错误处理
   schemas.py    请求模式（strict 模式，拒绝浮点/布尔/字符串与多余字段）
   solver.py     纯整数求解器：校验、候选生成、O(n·K) DP、计数截断、见证重构
+  analyze.py    窗口化批量分析：双向 DP 缓存基线边界、窗口内重算并拼接
   errors.py     DomainError 与错误码
 tests/
   brute.py      独立暴力枚举参考实现（itertools.product）
   test_solver.py  已知答案、随机对拍、转移算子对拍、规模上限
   test_api.py     HTTP 契约、错误信封、逐字节确定性
+  test_analyze.py 窗口分析：已知答案、逐场景穷举/求解器对拍、规模上限
+  test_analyze_api.py  窗口分析 HTTP 契约、场景错误隔离、模式错误
 scripts/
   oracle.py     验收用独立暴力预言机
-  acceptance.py 黑盒 HTTP 验收
+  acceptance.py 黑盒 HTTP 验收（含 analyze-windows 逐场景对拍与全量规模）
   verify.py     一次性验收入口（pytest + HTTP 验收）
 Dockerfile          python:3.13-slim 镜像
 docker-compose.yml  api（API_PORT 覆盖宿主端口）+ verify（一次性验收）
@@ -182,10 +267,13 @@ requirements.txt    运行与测试依赖
 
 ## 7. 规模与性能
 
-- 上限：`M ≤ 10^9`、`n ≤ 20000`、每时刻候选 ≤ 64。
-- 复杂度：时间 `O(n·K)`（L1 距离变换两遍扫描），空间 `O(n·K)`
-  （保存 `g` 行用于见证重构）；`n = 20000, K = 64` 实测约 0.5 秒、
-  内存约百兆量级。
+- 上限：`M ≤ 10^9`、`n ≤ 20000`、每时刻候选 ≤ 64；`/analyze-windows`
+  全部场景的替换点总数 `P ≤ 20000`。
+- 复杂度：`/solve` 时间 `O(n·K)`、空间 `O(n·K)`；
+  `/analyze-windows` 时间 `O((n+P)·K)`（基线双向 DP 各一遍 + 每场景仅
+  窗口内重算），空间 `O((n+B)·K)`（`B` 为缓存的边界行数）；
+  `n = 20000, K = 64` 时 `/solve` 实测约 0.5 秒，`n = P = 20000` 的
+  批量分析实测约 1–2 秒、内存约百兆量级。
 - 数值安全：全程 Python 任意精度整数，无浮点、无溢出；`x0` 与区间端点
   不限制取值范围（任意整数，含负数）。服务在启动时解除 CPython 默认的
   4300 位十进制 int↔str 转换限制（`sys.set_int_max_str_digits(0)`），

@@ -3,7 +3,11 @@
 Covers: health, known answers for all three statuses, brute-force
 cross-checks on random small instances, an independent O(n*K^2) cost
 recomputation on a larger instance, structured error envelopes and
-byte-level determinism of repeated requests.
+byte-level determinism of repeated requests — for both ``POST /solve`` and
+the windowed what-if batch endpoint ``POST /analyze-windows`` (per-scenario
+oracle cross-checks, empty-candidate repair/creation, scenario error
+isolation, and a full-scale n = P = 20000 batch that must not degrade to
+scenarios x full length).
 """
 from __future__ import annotations
 
@@ -68,6 +72,35 @@ def _quadratic_optimal_cost(M, n, r, lo, hi) -> int:
         src = rows[i + 1]
         g = [min(abs(c - s) + gv for s, gv in zip(src, g)) for c in rows[i]]
     return min(g)
+
+
+def _expected_analyze(M, n, r, x0, lo, hi, windows) -> dict:
+    """Expected analyze-windows response, recomputed per scenario with the
+    independent brute-force oracle on each modified instance.  ``windows``
+    are ``(start, end, lo, hi)`` tuples and must be well-formed."""
+    base = oracle_solve(M, n, r, x0, lo, hi)
+    if base["status"] == "impossible":
+        baseline = {"status": "impossible",
+                    "first_empty_index": base["first_empty_index"]}
+        base_cost = None
+    else:
+        baseline = {"status": base["status"], "cost": base["cost"]}
+        base_cost = base["cost"]
+    scenarios = []
+    for idx, (a, b, wlo, whi) in enumerate(windows):
+        lo2 = lo[:a - 1] + wlo + lo[b:]
+        hi2 = hi[:a - 1] + whi + hi[b:]
+        res = oracle_solve(M, n, r, x0, lo2, hi2)
+        if res["status"] == "impossible":
+            scenarios.append({"index": idx, "status": "impossible",
+                              "first_empty_index": res["first_empty_index"]})
+        else:
+            entry = {"index": idx, "status": res["status"],
+                     "cost": res["cost"]}
+            if base_cost is not None:
+                entry["delta"] = res["cost"] - base_cost
+            scenarios.append(entry)
+    return {"baseline": baseline, "scenarios": scenarios}
 
 
 def main() -> int:
@@ -202,6 +235,152 @@ def main() -> int:
         check("repeated requests are byte-identical",
               first.status_code == second.status_code
               and first.content == second.content)
+
+        # -- analyze-windows: known mixed answer ---------------------------
+        mixed = {"M": 5, "n": 3, "r": [0, 1, 2], "x0": 0,
+                 "lo": [1, 6], "hi": [1, 6],
+                 "scenarios": [
+                     {"start": 1, "end": 1, "lo": [0], "hi": [10]},
+                     {"start": 2, "end": 2, "lo": [0], "hi": [10]},
+                     {"start": 1, "end": 2, "lo": [0, 0], "hi": [10, 10]},
+                     {"start": 1, "end": 1, "lo": [3], "hi": [4]},
+                     {"start": 2, "end": 2, "lo": [8], "hi": [3]},
+                     {"start": 1, "end": 1, "lo": [0], "hi": [1000]},
+                 ]}
+        resp = client.post("/analyze-windows", json=mixed)
+        ok = resp.status_code == 200
+        if ok:
+            body = resp.json()
+            ok = body["baseline"] == {"status": "unique", "cost": 5} \
+                and [s["index"] for s in body["scenarios"]] == list(range(6))
+            if ok:
+                scen = body["scenarios"]
+                ok = scen[0] == {"index": 0, "status": "unique", "cost": 0,
+                                 "delta": -5} \
+                    and scen[1] == {"index": 1, "status": "unique", "cost": 0,
+                                    "delta": -5} \
+                    and scen[2] == {"index": 2, "status": "ambiguous",
+                                    "cost": 0, "delta": -5} \
+                    and scen[3] == {"index": 3, "status": "impossible",
+                                    "first_empty_index": 1} \
+                    and scen[4]["status"] == "error" \
+                    and scen[4]["error"]["code"] == "INVALID_INTERVAL" \
+                    and scen[4]["error"]["index"] == 2 \
+                    and scen[5]["status"] == "error" \
+                    and scen[5]["error"]["code"] == "TOO_MANY_CANDIDATES" \
+                    and scen[5]["error"]["index"] == 1
+        check("analyze-windows known mixed answer (incl. error isolation)",
+              ok, resp.text[:600])
+
+        # -- analyze-windows: empty-candidate repair and creation ----------
+        resp = client.post("/analyze-windows", json={
+            "M": 5, "n": 3, "r": [0, 1, 2], "x0": 0,
+            "lo": [0, 3], "hi": [1, 4],
+            "scenarios": [{"start": 2, "end": 2, "lo": [1], "hi": [1]},
+                          {"start": 1, "end": 1, "lo": [1], "hi": [1]},
+                          {"start": 1, "end": 1, "lo": [0], "hi": [0]}]})
+        ok = resp.status_code == 200 and resp.json() == {
+            "baseline": {"status": "impossible", "first_empty_index": 2},
+            "scenarios": [
+                {"index": 0, "status": "unique", "cost": 0},
+                {"index": 1, "status": "impossible", "first_empty_index": 2},
+                {"index": 2, "status": "impossible", "first_empty_index": 1},
+            ]}
+        check("analyze-windows empty-candidate repair/creation, no delta "
+              "when baseline infeasible", ok, resp.text[:400])
+
+        # -- analyze-windows: per-scenario oracle cross-check --------------
+        mismatches = 0
+        for trial in range(40):
+            n = rng.randint(2, 6)
+            M = rng.randint(2, 8)
+            r = [rng.randrange(M) for _ in range(n)]
+            x0 = r[0] + rng.randint(-2, 2) * M
+            lo, hi = [], []
+            for _ in range(n - 1):
+                a = rng.randint(-12, 12)
+                lo.append(a)
+                hi.append(a + rng.randint(0, 3 * M - 1))
+            windows = []
+            for _ in range(rng.randint(1, 4)):
+                a = rng.randint(1, n - 1)
+                b = rng.randint(a, n - 1)
+                wlo, whi = [], []
+                for _ in range(b - a + 1):
+                    x = rng.randint(-12, 12)
+                    wlo.append(x)
+                    whi.append(x + rng.randint(0, 3 * M - 1))
+                windows.append((a, b, wlo, whi))
+            payload = {"M": M, "n": n, "r": r, "x0": x0, "lo": lo, "hi": hi,
+                       "scenarios": [{"start": a, "end": b, "lo": wl,
+                                      "hi": wh}
+                                     for a, b, wl, wh in windows]}
+            resp = client.post("/analyze-windows", json=payload)
+            expected = _expected_analyze(M, n, r, x0, lo, hi, windows)
+            if resp.status_code != 200 or resp.json() != expected:
+                mismatches += 1
+                print(f"  analyze mismatch on {payload}: got "
+                      f"{resp.text[:300]}, want {expected}", flush=True)
+        check("40 random analyze-windows batches match per-scenario oracle",
+              mismatches == 0)
+
+        # -- analyze-windows: byte-level determinism -----------------------
+        first = client.post("/analyze-windows", json=mixed)
+        second = client.post("/analyze-windows", json=mixed)
+        check("analyze-windows repeated requests are byte-identical",
+              first.status_code == second.status_code == 200
+              and first.content == second.content)
+
+        # -- analyze-windows: full scale, n = P = 20000 --------------------
+        n, M = 20_000, 10**9
+        r = [rng.randrange(M) for _ in range(n)]
+        x0 = r[0] - 3 * M
+        lo, hi = [], []
+        for _ in range(n - 1):
+            a = rng.randint(-10**12, 10**12)
+            lo.append(a)
+            hi.append(a + 64 * M - 1)  # 64 candidates per epoch
+        windows = []
+        for i in range(1, n):
+            a = rng.randint(-10**12, 10**12)
+            windows.append((i, i, [a], [a + 64 * M - 1]))
+        a = rng.randint(-10**12, 10**12)
+        windows.append((1, 1, [a], [a + 64 * M - 1]))  # P = 20000 total
+        payload = {"M": M, "n": n, "r": r, "x0": x0, "lo": lo, "hi": hi,
+                   "scenarios": [{"start": a_, "end": b_, "lo": wl, "hi": wh}
+                                 for a_, b_, wl, wh in windows]}
+        started = time.monotonic()
+        resp = client.post("/analyze-windows", json=payload)
+        elapsed = time.monotonic() - started
+        ok = resp.status_code == 200 and elapsed < 60
+        if ok:
+            body = resp.json()
+            ok = body["baseline"]["status"] in ("unique", "ambiguous") \
+                and [s["index"] for s in body["scenarios"]] == \
+                list(range(20_000)) \
+                and all(s["status"] in ("unique", "ambiguous")
+                        and s["delta"] == s["cost"] - body["baseline"]["cost"]
+                        for s in body["scenarios"])
+        check(f"analyze-windows full scale n=P=20000 in {elapsed:.1f}s "
+              "(no scenarios x length degradation)", ok,
+              resp.text[:200] if not ok else "")
+        # spot-check three scenarios with full /solve runs on the modified
+        # instances (the checker may re-solve; the endpoint must not)
+        if resp.status_code == 200:
+            body = resp.json()
+            spot_ok = True
+            for idx in (0, 10_000, 19_999):
+                a_, b_, wl, wh = windows[idx]
+                lo2 = lo[:a_ - 1] + wl + lo[b_:]
+                hi2 = hi[:a_ - 1] + wh + hi[b_:]
+                ref = post({"M": M, "n": n, "r": r, "x0": x0,
+                            "lo": lo2, "hi": hi2})
+                entry = body["scenarios"][idx]
+                spot_ok = spot_ok and ref.status_code == 200 \
+                    and entry["status"] == ref.json()["status"] \
+                    and entry["cost"] == ref.json()["cost"]
+            check("analyze-windows full-scale spot checks match /solve",
+                  spot_ok)
 
     if _failures:
         print(f"acceptance: {len(_failures)} check(s) failed: "
